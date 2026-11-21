@@ -1,92 +1,80 @@
 # Wavefall Media Downloader
 
-A simple desktop app for downloading video and audio from links, built as a lighter
-replacement for JDownloader. It's a Python + PySide6 (Qt) window on top of
-[yt-dlp](https://github.com/yt-dlp/yt-dlp), with ffmpeg handling audio conversion and merging.
+A desktop app for downloading video and audio from YouTube, SoundCloud, Bandcamp and
+[many other sites](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md).
+Built with [yt-dlp](https://github.com/yt-dlp/yt-dlp) and Qt (PySide6).
 
-![Wavefall Media Downloader window](docs/screenshot.png)
+![Screenshot](docs/screenshot.png)
 
 ## Features
 
-- **Queue list**: add as many links as you like. Each one gets a row with a progress bar,
-  size, speed and time left. Up to "At once" downloads run in parallel (default 2).
-- **Video or audio only**: pick a video quality (Best, 2160p … 360p), or for audio only pick
-  **MP3, M4A or Opus** and a bitrate. At each resolution the app prefers H.264/AAC `.mp4`
-  files, so they play everywhere.
-- **Playlists**: tick *Whole playlist* and every item in a playlist link is added to the
-  queue, saved in a sub-folder named after the playlist. Leave it unticked to fetch just the
-  one video, even if the link contains `&list=…`.
-- **Pause / Resume / Cancel / Retry**: pausing keeps the partial file and resuming carries on
-  from there. Cancelling deletes the partial file. Retry restarts a failed item. Hover over a
-  failed row, or double-click it, to see the error.
-- **History**: the list is kept between sessions. Downloads that were running when you closed
-  the app come back as *Paused*, so you can resume them.
-- **Save folder**: *Change…* picks the folder and *Open* opens it. Double-click a finished row
-  to play the file. Right-click a row for more options.
-- You can paste several links at once, separated by spaces or new lines.
+- Download queue with pause, resume, cancel and retry
+- Video up to 4K, or audio only as MP3, M4A or Opus
+- Audio files named `Artist - Song`
+- Playlist support: preview a playlist and choose which items to download
+- Several downloads at once
+- Update notifications for the app and yt-dlp
 
-It doesn't do anything to get around DRM, paywalls or logins. It downloads what a site serves
-publicly.
+## Requirements
 
-## Setup (one time)
+- Linux (tested on Linux Mint 22 and Ubuntu 24.04)
+- Python 3.10 or newer
+- git, ffmpeg, python3-venv
+- [Deno](https://deno.com) or Node.js 20+ (needed for YouTube)
 
-1. **ffmpeg** is needed for MP3/M4A/Opus conversion and for the best video quality, where video
-   and audio are merged. It's already installed on this machine. If it ever isn't:
+## Installation
 
-   ```bash
-   sudo apt install ffmpeg
-   ```
-
-   Without ffmpeg the app still works, but it saves audio in its original format and only
-   fetches video formats that come as a single file. A yellow notice in the window explains this.
-
-2. **App environment** (no sudo needed). This creates `.venv/` in this folder, installs PySide6 and
-   a current yt-dlp into it, and adds *Wavefall Media Downloader* to the Cinnamon menu:
-
-   ```bash
-   ~/projects/wavefall-media-downloader/setup.sh
-   ```
-
-   The app uses its own up-to-date yt-dlp from `.venv`, not the much older `yt-dlp` apt package.
-
-## Launching
-
-- From the **Cinnamon menu**: search for *Wavefall* or "downloader". It is listed under Internet.
-  Right-click it and choose *Add to panel* or *Add to desktop* if you want a shortcut.
-- From a terminal:
-
-  ```bash
-  ~/projects/wavefall-media-downloader/run.sh
-  ```
-
-## Keeping it working
-
-Each time it opens, the app checks for a newer release of itself on GitHub and a newer yt-dlp.
-If there is one, a bar appears under the folder row with **Update now**. Downloads can carry on
-while it installs; then click **Restart now**. The check is silent when you're offline.
-
-Video sites change often. If downloads that used to work start failing, you can also update
-everything from a terminal:
+Install the system packages:
 
 ```bash
-~/projects/wavefall-media-downloader/update.sh
+sudo apt install git ffmpeg python3-venv unzip
 ```
 
-YouTube also needs a JavaScript runtime. The app finds `deno` or `node` on its own (including
-node installed through nvm), so nothing extra is needed here.
+Install Deno, if you don't already have Deno or Node.js 20+:
 
-## Files
+```bash
+curl -fsSL https://deno.land/install.sh | sh
+```
 
-| Path | What it is |
-| --- | --- |
-| `wavefall.py` | The whole app |
-| `run.sh` | Starts the app with the bundled environment |
-| `setup.sh` | Creates `.venv`, installs dependencies, adds the menu entry |
-| `update.sh` | Updates the app (git pull) and yt-dlp |
-| `wavefall-media-downloader.svg` | The app icon. `docs/icons/` has the other designs that were tried |
-| `~/.local/share/wavefall-media-downloader/history.json` | The saved download list |
-| `~/.config/wavefall-media-downloader/wavefall-media-downloader.conf` | Remembered settings (folder, quality, window size) |
-| `~/.local/share/applications/wavefall-media-downloader.desktop` | Menu entry |
-| `~/.local/share/icons/hicolor/*/apps/wavefall-media-downloader.*` | App icon (from `wavefall-media-downloader.svg`, installed by `install-icon.py`) |
+Download and set up the app:
 
-To uninstall, delete this folder and the files listed above.
+```bash
+git clone https://github.com/MarkFergus/wavefall-media-downloader.git ~/Applications/wavefall-media-downloader
+cd ~/Applications/wavefall-media-downloader
+./setup.sh
+```
+
+Then open **Wavefall Media Downloader** from your applications menu, or run `./run.sh`.
+
+## Usage
+
+1. Paste a link and choose **Video** or **Audio only**.
+2. Pick the quality or audio format.
+3. Click **Add**. The download starts straight away.
+
+Tick **Whole playlist** to download every item in a playlist. Double-click a finished
+download to play it, or right-click it for more options.
+
+## Updating
+
+The app checks for updates when it starts and shows **Update now** when one is available.
+To update manually:
+
+```bash
+~/Applications/wavefall-media-downloader/update.sh
+```
+
+If downloads from a site stop working, updating usually fixes it.
+
+## Uninstalling
+
+```bash
+rm -rf ~/Applications/wavefall-media-downloader
+rm -f ~/.local/share/applications/wavefall-media-downloader.desktop
+rm -f ~/.local/share/icons/hicolor/*/apps/wavefall-media-downloader.*
+rm -rf ~/.local/share/wavefall-media-downloader ~/.config/wavefall-media-downloader
+```
+
+## License
+
+[MIT](LICENSE)

@@ -126,7 +126,8 @@ def music_name(info: dict) -> tuple[str, bool]:
     title = clean_title(info.get("title") or "")
     m = re.match(r"^(.+?)\s+[-–—]\s+(.+)$", title)
     if m:
-        return f"{m[1].strip()} - {m[2].strip().strip('\"“”')}", True
+        artist, song = m[1].strip(), m[2].strip().strip('"“”')
+        return f"{artist} - {song}", True
     channel = info.get("channel") or info.get("uploader") or ""
     if channel.endswith(" - Topic") and title:     # YouTube's auto-generated artist channels
         return f"{channel[:-8]} - {title}", True
