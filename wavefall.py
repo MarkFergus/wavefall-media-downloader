@@ -17,23 +17,29 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
-from PySide6.QtCore import QObject, QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QProcess, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon, QKeySequence
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog,
+    QDialogButtonBox, QFrame, QInputDialog, QTreeWidget, QTreeWidgetItem,
     QFileDialog, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QRadioButton,
-    QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QSpinBox, QStyle, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
 import yt_dlp
 from yt_dlp.utils import DownloadCancelled, DownloadError
 
 APP_NAME = "Wavefall Media Downloader"
+APP_VERSION = "0.1"
+APP_REPO = "MarkFergus/wavefall-media-downloader"   # GitHub repo; its releases announce updates
+APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "wavefall-media-downloader"
 HISTORY_FILE = DATA_DIR / "history.json"
 
@@ -97,6 +103,93 @@ def safe_dirname(name: str) -> str:
     return name[:120] or "Playlist"
 
 
+# Bracketed clutter in music video titles, e.g. "(Official Video)", "[Lyrics]", "(HD)"
+_TITLE_JUNK = re.compile(
+    r"\s*[(\[][^)\]]*\b(official|lyrics?|audio|video|visuali[sz]er|hd|hq|4k|mv|m/v)\b[^)\]]*[)\]]",
+    re.I)
+
+
+def clean_title(title: str) -> str:
+    t = _TITLE_JUNK.sub("", title)
+    t = re.sub(r"\s+\|\s+.*$", "", t)          # "Song | Some Channel"
+    return re.sub(r"\s{2,}", " ", t).strip()
+
+
+def music_name(info: dict) -> tuple[str, bool]:
+    """Work out "Artist - Song" for a track. Returns (name, sure); when not sure the
+    name is only a best guess and the user should check it."""
+    artist = (info.get("artist") or (info.get("artists") or [None])[0]
+              or info.get("creator"))
+    track = info.get("track")
+    if artist and track:
+        return f"{artist} - {track}", True
+    title = clean_title(info.get("title") or "")
+    m = re.match(r"^(.+?)\s+[-–—]\s+(.+)$", title)
+    if m:
+        return f"{m[1].strip()} - {m[2].strip().strip('\"“”')}", True
+    channel = info.get("channel") or info.get("uploader") or ""
+    if channel.endswith(" - Topic") and title:     # YouTube's auto-generated artist channels
+        return f"{channel[:-8]} - {title}", True
+    if artist and title:
+        return f"{artist} - {title}", True
+    if channel and title:
+        return f"{channel} - {title}", False
+    return title or info.get("id") or "", False
+
+
+def safe_filename(name: str) -> str:
+    return re.sub(r'[\\/\x00-\x1f]', "_", name).strip(" .")[:180]
+
+
+def playlist_kind(url: str) -> str | None:
+    """Guess from the link alone whether it involves a playlist.
+
+    Returns "playlist" for a link to a playlist itself, "item" for a single video or
+    track that carries a playlist with it, or None. A quick guess, so the user can be
+    asked before anything is looked up."""
+    try:
+        u = urlparse(url)
+    except ValueError:
+        return None
+    host = (u.hostname or "").lower()
+    path = u.path.lower().rstrip("/")
+    qs = parse_qs(u.query)
+    parts = path.split("/")
+    if "youtube.com" in host or host == "youtu.be":
+        if not qs.get("list"):
+            return None
+        return "item" if (qs.get("v") or host == "youtu.be" or "/shorts/" in path) else "playlist"
+    if "soundcloud.com" in host:
+        if "sets" in parts:
+            return "playlist"
+        return "item" if qs.get("in") else None
+    if "bandcamp.com" in host and "album" in parts:
+        return "playlist"
+    if {"playlist", "playlists", "album", "albums"} & set(parts):
+        return "playlist"
+    return "item" if qs.get("list") else None
+
+
+def playlist_url(url: str) -> str:
+    """For a track link that names its playlist separately (SoundCloud's ?in=), return
+    the playlist's own link, since the track link alone won't expand to the playlist."""
+    u = urlparse(url)
+    if "soundcloud.com" in (u.hostname or "") and (inn := parse_qs(u.query).get("in")):
+        return f"https://soundcloud.com/{inn[0].strip('/')}"
+    return url
+
+
+def version_tuple(v: str) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", v))
+
+
+def fetch_json(url: str) -> dict:
+    req = urllib.request.Request(url, headers={"User-Agent": f"wavefall-media-downloader/{APP_VERSION}",
+                                               "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.load(r)
+
+
 def open_path(path: str) -> None:
     subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -113,6 +206,7 @@ class Job:
     folder: str
     subdir: str = ""
     title: str = ""
+    filename: str = ""            # "Artist - Song" for audio; empty uses the default name
     status: str = QUEUED
     progress: float = 0.0
     filepath: str = ""
@@ -126,7 +220,7 @@ class Job:
     eta: float | None = field(default=None, repr=False)
 
     SAVED = ("url", "mode", "quality", "audio_format", "audio_bitrate", "folder", "subdir",
-             "title", "status", "progress", "filepath", "error", "size", "tmpfiles", "id", "added")
+             "title", "filename", "status", "progress", "filepath", "error", "size", "tmpfiles", "id", "added")
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -151,8 +245,10 @@ class Job:
 class Signals(QObject):
     progress = Signal(str, dict)          # job id, fields to update
     finished = Signal(str, str, str)      # job id, final status, message/filepath
-    resolved = Signal(list, str, dict)    # list of (url, title) entries, subdir, choice
+    resolved = Signal(list, str, dict)    # list of (url, title, seconds, name, sure) entries, subdir, choice
     resolve_failed = Signal(str, str)     # url, error
+    updates_found = Signal(dict)          # {"app": {"version", "url"} | None, "ytdlp": str | None}
+    update_done = Signal(bool, str)       # success, message
 
 
 class StopRequested(DownloadCancelled):
@@ -171,7 +267,8 @@ def build_options(job: Job, ffmpeg: str | None, js_runtimes: dict) -> dict:
     outdir = Path(job.folder) / job.subdir if job.subdir else Path(job.folder)
     opts = {
         "logger": QuietLogger(),
-        "outtmpl": str(outdir / "%(title).180B [%(id)s].%(ext)s"),
+        "outtmpl": str(outdir / (safe_filename(job.filename).replace("%", "%%") + ".%(ext)s"
+                                 if job.filename else "%(title).180B [%(id)s].%(ext)s")),
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
@@ -339,18 +436,176 @@ class ResolveWorker(threading.Thread):
                     continue
                 u = e.get("webpage_url") or e.get("url")
                 if u:
-                    entries.append((u, e.get("title") or ""))
+                    entries.append((u, e.get("title") or "", e.get("duration"),
+                                    *music_name(e)))
             subdir = safe_dirname(info.get("title") or info.get("id") or "Playlist")
             self.signals.resolved.emit(entries, subdir, self.choice)
         else:
             url = info.get("webpage_url") or self.url
-            self.signals.resolved.emit([(url, info.get("title") or "")], "", self.choice)
+            self.signals.resolved.emit(
+                [(url, info.get("title") or "", info.get("duration"), *music_name(info))],
+                "", self.choice)
+
+
+class UpdateChecker(threading.Thread):
+    """Looks for a newer app release on GitHub and a newer yt-dlp on PyPI. Stays quiet on
+    any network error: an update check should never get in the way."""
+
+    def __init__(self, signals: Signals):
+        super().__init__(daemon=True)
+        self.signals = signals
+
+    def run(self) -> None:
+        found = {"app": None, "ytdlp": None}
+        try:
+            rel = fetch_json(f"https://api.github.com/repos/{APP_REPO}/releases/latest")
+            tag = rel.get("tag_name", "")
+            if tag and version_tuple(tag) > version_tuple(APP_VERSION):
+                found["app"] = {"version": tag.lstrip("vV"), "url": rel.get("html_url", "")}
+        except Exception:  # noqa: BLE001  (no releases yet, offline, rate-limited…)
+            pass
+        try:
+            latest = fetch_json("https://pypi.org/pypi/yt-dlp/json")["info"]["version"]
+            if version_tuple(latest) > version_tuple(yt_dlp.version.__version__):
+                found["ytdlp"] = latest
+        except Exception:  # noqa: BLE001
+            pass
+        if found["app"] or found["ytdlp"]:
+            self.signals.updates_found.emit(found)
+
+
+class Updater(threading.Thread):
+    """Installs updates: git pull for the app (when it was installed from git), then pip."""
+
+    def __init__(self, signals: Signals, app: bool):
+        super().__init__(daemon=True)
+        self.signals, self.app = signals, app
+
+    def run(self) -> None:
+        steps = []
+        if self.app:
+            steps.append(["git", "-C", str(APP_DIR), "pull", "--ff-only"])
+            steps.append([sys.executable, "-m", "pip", "install", "--upgrade",
+                          "-r", str(APP_DIR / "requirements.txt")])
+        else:
+            steps.append([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp[default]"])
+        for cmd in steps:
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            except Exception as e:  # noqa: BLE001
+                self.signals.update_done.emit(False, f"{' '.join(cmd[:4])}…\n\n{e}")
+                return
+            if r.returncode != 0:
+                out = (r.stderr or r.stdout).strip()[-1500:]
+                self.signals.update_done.emit(False, f"{' '.join(cmd[:4])}… failed:\n\n{out}")
+                return
+        self.signals.update_done.emit(True, "")
 
 
 # --------------------------------------------------------------------------- UI
 
 COLS = ["Title", "Type", "Progress", "Size", "Speed", "ETA", "Status"]
 C_TITLE, C_TYPE, C_PROG, C_SIZE, C_SPEED, C_ETA, C_STATUS = range(len(COLS))
+
+
+class PlaylistDialog(QDialog):
+    """Shows a playlist's items so the user can pick which ones to add."""
+
+    def __init__(self, parent, name: str, entries: list, audio: bool):
+        super().__init__(parent)
+        self.setWindowTitle("Playlist")
+        self.resize(860 if audio else 640, 480)
+        self.audio = audio
+        lay = QVBoxLayout(self)
+        heading = QLabel(name, textFormat=Qt.PlainText)
+        font = heading.font()
+        font.setBold(True)
+        heading.setFont(font)
+        lay.addWidget(heading)
+        unsure = sum(not e[4] for e in entries) if audio else 0
+        if unsure:
+            note = QLabel(f"⚠ {unsure} file name{'s' if unsure != 1 else ''} couldn't be worked "
+                          "out as “Artist - Song”. Double-click a name to edit it.")
+            note.setWordWrap(True)
+            lay.addWidget(note)
+
+        self.tree = QTreeWidget(rootIsDecorated=False, uniformRowHeights=True)
+        self.tree.setHeaderLabels(["#", "Title", "Length"] + (["Save as"] if audio else []))
+        warn = QIcon.fromTheme("dialog-warning",
+                               self.style().standardIcon(QStyle.SP_MessageBoxWarning))
+        for i, (url, title, secs, fname, sure) in enumerate(entries, 1):
+            cols = [str(i), title or url, human_eta(secs) if secs else ""]
+            item = QTreeWidgetItem(cols + ([fname] if audio else []))
+            item.setCheckState(0, Qt.Checked)
+            item.setToolTip(1, url)
+            item.setTextAlignment(2, Qt.AlignRight | Qt.AlignVCenter)
+            if audio:
+                item.setFlags(item.flags() | Qt.ItemIsEditable)
+                if not sure:
+                    item.setIcon(3, warn)
+                    item.setToolTip(3, "Couldn't find the artist and song name. "
+                                       "Double-click to edit.")
+            self.tree.addTopLevelItem(item)
+        self.tree.setEditTriggers(QAbstractItemView.EditKeyPressed)
+        hh = self.tree.header()
+        hh.setStretchLastSection(False)
+        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        if audio:
+            hh.setSectionResizeMode(3, QHeaderView.Stretch)
+        self.tree.itemChanged.connect(lambda *_: self._update_count())
+        self.tree.itemDoubleClicked.connect(self._toggle)
+        lay.addWidget(self.tree)
+
+        row = QHBoxLayout()
+        for text, state in (("Select all", Qt.Checked), ("Select none", Qt.Unchecked)):
+            b = QPushButton(text)
+            b.clicked.connect(lambda _=False, st=state: self._set_all(st))
+            row.addWidget(b)
+        row.addStretch(1)
+        self.count_label = QLabel()
+        row.addWidget(self.count_label)
+        lay.addLayout(row)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        lay.addWidget(self.buttons)
+        self._entries = entries
+        self._update_count()
+
+    def _items(self):
+        return [self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount())]
+
+    def _toggle(self, item, col):
+        if self.audio and col == 3:
+            self.tree.editItem(item, 3)
+            return
+        item.setCheckState(0, Qt.Unchecked if item.checkState(0) == Qt.Checked else Qt.Checked)
+
+    def _set_all(self, state):
+        self.tree.blockSignals(True)
+        for item in self._items():
+            item.setCheckState(0, state)
+        self.tree.blockSignals(False)
+        self._update_count()
+
+    def _update_count(self):
+        n = sum(it.checkState(0) == Qt.Checked for it in self._items())
+        self.count_label.setText(f"{n} of {len(self._entries)} selected")
+        ok = self.buttons.button(QDialogButtonBox.Ok)
+        ok.setText(f"Add {n} item{'s' if n != 1 else ''}")
+        ok.setEnabled(n > 0)
+
+    def selected(self) -> list:
+        out = []
+        for e, it in zip(self._entries, self._items()):
+            if it.checkState(0) == Qt.Checked:
+                if self.audio:
+                    e = (*e[:3], it.text(3).strip(), True)
+                out.append(e)
+        return out
 
 
 class MainWindow(QMainWindow):
@@ -372,9 +627,13 @@ class MainWindow(QMainWindow):
         self.signals.finished.connect(self.on_finished)
         self.signals.resolved.connect(self.on_resolved)
         self.signals.resolve_failed.connect(self.on_resolve_failed)
+        self.signals.updates_found.connect(self.on_updates_found)
+        self.signals.update_done.connect(self.on_update_done)
 
         self._build_ui()
         self._load_history()
+        self.updates: dict = {}
+        UpdateChecker(self.signals).start()
 
         self.save_timer = QTimer(self, interval=3000, timeout=self._save_history)
         self.save_timer.start()
@@ -401,6 +660,10 @@ class MainWindow(QMainWindow):
         self.add_btn.setIcon(QIcon.fromTheme("list-add"))
         self.add_btn.clicked.connect(self.add_clicked)
         top.addWidget(self.add_btn, 0, 8)
+        about_btn = QToolButton(text="?", autoRaise=True)
+        about_btn.setToolTip(f"About {APP_NAME}")
+        about_btn.clicked.connect(self.show_about)
+        top.addWidget(about_btn, 0, 9)
 
         mode_row = QHBoxLayout()
         self.video_radio = QRadioButton("Video")
@@ -447,6 +710,24 @@ class MainWindow(QMainWindow):
         open_btn.clicked.connect(lambda: open_path(self.folder_edit.text()))
         top.addWidget(open_btn, 2, 8)
         top.setColumnStretch(1, 1)
+
+        self.update_bar = QFrame(frameShape=QFrame.StyledPanel)
+        bar = QHBoxLayout(self.update_bar)
+        bar.setContentsMargins(8, 4, 4, 4)
+        self.update_label = QLabel()
+        self.update_label.setWordWrap(True)
+        bar.addWidget(self.update_label, 1)
+        self.update_notes_btn = QPushButton("What's new")
+        self.update_notes_btn.clicked.connect(
+            lambda: open_path((self.updates.get("app") or {}).get("url", "")))
+        self.update_now_btn = QPushButton("Update now")
+        self.update_now_btn.clicked.connect(self.install_updates)
+        self.update_later_btn = QPushButton("Later")
+        self.update_later_btn.clicked.connect(self.update_bar.hide)
+        for b in (self.update_notes_btn, self.update_now_btn, self.update_later_btn):
+            bar.addWidget(b)
+        self.update_bar.hide()
+        root.addWidget(self.update_bar)
 
         self.notice = QLabel()
         self.notice.setWordWrap(True)
@@ -516,6 +797,72 @@ class MainWindow(QMainWindow):
         else:
             self.notice.hide()
 
+    def show_about(self):
+        QMessageBox.about(
+            self, f"About {APP_NAME}",
+            f"<b>{APP_NAME}</b><br>Version {APP_VERSION}<br><br>"
+            f"yt-dlp {yt_dlp.version.__version__}<br>"
+            f"ffmpeg: {'found' if self.ffmpeg else 'not found'}")
+
+    # ---- updates
+    def on_updates_found(self, found: dict):
+        self.updates = found
+        parts = []
+        if found["app"]:
+            parts.append(f"{APP_NAME} {found['app']['version']} is available "
+                         f"(you have {APP_VERSION}).")
+        if found["ytdlp"]:
+            parts.append(f"yt-dlp {found['ytdlp']} is available (you have "
+                         f"{yt_dlp.version.__version__}). Sites change often, so keeping it "
+                         "current keeps downloads working.")
+        self.update_label.setText(" ".join(parts))
+        self.update_notes_btn.setVisible(bool(found["app"] and found["app"]["url"]))
+        self.update_now_btn.setText("Update now")
+        self.update_now_btn.setEnabled(True)
+        self.update_later_btn.setEnabled(True)
+        self.update_bar.show()
+
+    def install_updates(self):
+        if self.update_now_btn.text() == "Restart now":
+            self.restart()
+            return
+        app = bool(self.updates.get("app"))
+        if app and not (APP_DIR / ".git").is_dir():
+            # Not installed from git: send the user to the release page instead
+            QMessageBox.information(
+                self, "Update", "This copy wasn't installed with git, so it can't update "
+                "itself. The release page will open so you can download the new version.")
+            open_path(self.updates["app"]["url"])
+            if not self.updates.get("ytdlp"):
+                return
+            app = False
+        if app and not shutil.which("git"):
+            QMessageBox.warning(self, "Update", "git isn't installed, so the app can't update "
+                                "itself. Install it with:  sudo apt install git")
+            return
+        self.update_label.setText("Updating… downloads can carry on meanwhile.")
+        for b in (self.update_now_btn, self.update_later_btn, self.update_notes_btn):
+            b.setEnabled(False)
+        Updater(self.signals, app).start()
+
+    def on_update_done(self, ok: bool, msg: str):
+        self.update_later_btn.setEnabled(True)
+        self.update_notes_btn.setEnabled(True)
+        if ok:
+            self.update_label.setText("Update installed. Restart the app to start using it.")
+            self.update_now_btn.setText("Restart now")
+            self.update_now_btn.setEnabled(True)
+        else:
+            self.update_label.setText("The update didn't finish.")
+            self.update_now_btn.setText("Try again")
+            self.update_now_btn.setEnabled(True)
+            QMessageBox.warning(self, "Update failed", msg)
+
+    def restart(self):
+        # close() asks first if downloads are running (they're paused and resumable)
+        if self.close():
+            QProcess.startDetached(sys.executable, [str(APP_DIR / "wavefall.py")] + sys.argv[1:])
+
     def _button(self, text, icon, slot):
         b = QPushButton(QIcon.fromTheme(icon), text)
         b.clicked.connect(slot)
@@ -544,11 +891,46 @@ class MainWindow(QMainWindow):
         for url in urls:
             if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
                 url = "https://" + url
+            want_playlist = self.playlist_check.isChecked()
+            if not want_playlist and (kind := playlist_kind(url)):
+                answer = self._ask_playlist(url, kind)
+                if answer is None:
+                    continue
+                want_playlist = answer
+                if want_playlist:
+                    url = playlist_url(url)
             self.pending_resolves += 1
-            ResolveWorker(url, self.playlist_check.isChecked(), self._current_choice(),
+            ResolveWorker(url, want_playlist, self._current_choice(),
                           self.signals, self.js_runtimes).start()
         self.url_edit.clear()
         self._update_status()
+
+    def _ask_playlist(self, url: str, kind: str) -> bool | None:
+        """Ask what to do with a playlist link while "Whole playlist" is off.
+        Returns True for the whole playlist, False for just the one item, None to skip it."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Playlist link")
+        whole = box.addButton("Whole playlist", QMessageBox.AcceptRole)
+        single = None
+        if kind == "item":
+            box.setText("This link is part of a playlist.")
+            box.setInformativeText("Add the whole playlist, or just this one item?\n\n" + url)
+            single = box.addButton("Just this item", QMessageBox.AcceptRole)
+            box.setDefaultButton(single)
+        else:
+            box.setText("This link is a playlist.")
+            box.setInformativeText("“Whole playlist” is off, but this link has no single "
+                                   "item to add. Add every item in the playlist?\n\n" + url)
+            box.setDefaultButton(whole)
+        box.addButton(QMessageBox.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is whole:
+            return True
+        if single is not None and clicked is single:
+            return False
+        return None
 
     def _current_choice(self) -> dict:
         return dict(
@@ -561,9 +943,30 @@ class MainWindow(QMainWindow):
 
     def on_resolved(self, entries: list, subdir: str, choice: dict):
         self.pending_resolves -= 1
+        self._update_status()
+        if subdir:
+            if not entries:
+                self.status.showMessage(f"Playlist “{subdir}” has no items to add", 6000)
+                return
+            dlg = PlaylistDialog(self, subdir, entries, choice["mode"] == "audio")
+            if dlg.exec() != QDialog.Accepted:
+                return
+            entries = dlg.selected()
+        elif choice["mode"] == "audio" and entries and not entries[0][4]:
+            url, title, secs, fname, _ = entries[0]
+            fname, ok = QInputDialog.getText(
+                self, "Name this file",
+                f"Couldn't find the artist and song name for:\n{title or url}\n\n"
+                "Save as (Artist - Song):", text=fname)
+            if not ok:
+                self.status.showMessage("Not added", 4000)
+                return
+            entries = [(url, title, secs, fname.strip(), True)]
         skipped = 0
-        for url, title in entries:
-            job = Job(url=url, title=title, subdir=subdir, **choice)
+        for url, title, _secs, fname, _sure in entries:
+            audio = choice["mode"] == "audio"
+            job = Job(url=url, title=(fname or title) if audio else title,
+                      filename=fname if audio else "", subdir=subdir, **choice)
             if any(j.url == job.url and j.type_label == job.type_label
                    and j.status in ACTIVE | {QUEUED, PAUSED} for j in self.jobs):
                 skipped += 1   # already in the list; a second copy would clash

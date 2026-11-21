@@ -61,7 +61,12 @@ publicly.
 
 ## Keeping it working
 
-Video sites change often. If downloads that used to work start failing, update yt-dlp:
+Each time it opens, the app checks for a newer release of itself on GitHub and a newer yt-dlp.
+If there is one, a bar appears under the folder row with **Update now**. Downloads can carry on
+while it installs; then click **Restart now**. The check is silent when you're offline.
+
+Video sites change often. If downloads that used to work start failing, you can also update
+everything from a terminal:
 
 ```bash
 ~/projects/wavefall-media-downloader/update.sh
@@ -77,7 +82,7 @@ node installed through nvm), so nothing extra is needed here.
 | `wavefall.py` | The whole app |
 | `run.sh` | Starts the app with the bundled environment |
 | `setup.sh` | Creates `.venv`, installs dependencies, adds the menu entry |
-| `update.sh` | Updates yt-dlp |
+| `update.sh` | Updates the app (git pull) and yt-dlp |
 | `wavefall-media-downloader.svg` | The app icon. `docs/icons/` has the other designs that were tried |
 | `~/.local/share/wavefall-media-downloader/history.json` | The saved download list |
 | `~/.config/wavefall-media-downloader/wavefall-media-downloader.conf` | Remembered settings (folder, quality, window size) |
