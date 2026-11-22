@@ -23,13 +23,13 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from PySide6.QtCore import QObject, QProcess, QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import QLocale, QObject, QProcess, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QFrame, QInputDialog, QTreeWidget, QTreeWidgetItem,
     QFileDialog, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QRadioButton,
+    QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
     QSpinBox, QStyle, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -37,7 +37,7 @@ import yt_dlp
 from yt_dlp.utils import DownloadCancelled, DownloadError
 
 APP_NAME = "Wavefall Media Downloader"
-APP_VERSION = "0.1"
+APP_VERSION = "0.2"
 APP_REPO = "MarkFergus/wavefall-media-downloader"   # GitHub repo; its releases announce updates
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "wavefall-media-downloader"
@@ -138,6 +138,15 @@ def music_name(info: dict) -> tuple[str, bool]:
     return title or info.get("id") or "", False
 
 
+def subtitle_langs() -> list[str]:
+    """Exact codes for the user's language, then English. Kept short on purpose: every code
+    is a separate request, and YouTube rate-limits (HTTP 429) when asked for many."""
+    lang, _, country = QLocale().name().partition("_")
+    codes = [lang, f"{lang}-{country}"] if lang and lang != "C" else []
+    codes += ["en", "en-GB", "en-US"]
+    return list(dict.fromkeys(c for c in codes if c and not c.endswith("-")))
+
+
 def safe_filename(name: str) -> str:
     return re.sub(r'[\\/\x00-\x1f]', "_", name).strip(" .")[:180]
 
@@ -208,6 +217,7 @@ class Job:
     subdir: str = ""
     title: str = ""
     filename: str = ""            # "Artist - Song" for audio; empty uses the default name
+    subtitles: bool = False       # video only: download and embed subtitles
     status: str = QUEUED
     progress: float = 0.0
     filepath: str = ""
@@ -221,7 +231,7 @@ class Job:
     eta: float | None = field(default=None, repr=False)
 
     SAVED = ("url", "mode", "quality", "audio_format", "audio_bitrate", "folder", "subdir",
-             "title", "filename", "status", "progress", "filepath", "error", "size", "tmpfiles", "id", "added")
+             "title", "filename", "subtitles", "status", "progress", "filepath", "error", "size", "tmpfiles", "id", "added")
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -238,7 +248,8 @@ class Job:
     def type_label(self) -> str:
         if self.mode == "audio":
             return self.audio_format.upper()
-        return "Video" if self.quality == "Best" else f"Video {self.quality}"
+        label = "Video" if self.quality == "Best" else f"Video {self.quality}"
+        return label + " + subs" if self.subtitles else label
 
 
 # --------------------------------------------------------------------------- workers
@@ -307,6 +318,13 @@ def build_options(job: Job, ffmpeg: str | None, js_runtimes: dict) -> dict:
             opts["merge_output_format"] = "mp4/mkv"
         else:
             opts["format"] = f"best{limit}[acodec!=none][vcodec!=none]/best"
+        if job.subtitles:
+            opts["writesubtitles"] = True
+            opts["writeautomaticsub"] = True       # used only when there are no real ones
+            opts["subtitleslangs"] = subtitle_langs()
+            if ffmpeg:   # embed into the video; without ffmpeg they're saved beside it
+                opts.setdefault("postprocessors", []).append(
+                    {"key": "FFmpegEmbedSubtitle", "already_have_subtitle": False})
     return opts
 
 
@@ -367,14 +385,42 @@ class DownloadWorker(threading.Thread):
             self.signals.progress.emit(self.job.id, {"status": PROCESSING, "speed": None,
                                                      "eta": None, "progress": 100})
 
-    def run(self) -> None:
+    def _download(self, subtitles: bool) -> dict:
         opts = build_options(self.job, self.ffmpeg, self.js_runtimes)
+        if not subtitles:
+            for k in ("writesubtitles", "writeautomaticsub", "subtitleslangs"):
+                opts.pop(k, None)
+            opts["postprocessors"] = [pp for pp in opts.get("postprocessors", [])
+                                      if pp["key"] != "FFmpegEmbedSubtitle"]
         opts["progress_hooks"] = [self._hook]
         opts["postprocessor_hooks"] = [self._pp_hook]
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(self.job.url, download=True)
+            return ydl.sanitize_info(info)
+
+    def _remove_subtitle_files(self, info: dict) -> None:
+        """Delete subtitle files left over from a failed subtitle download."""
+        vid = info.get("id")
+        if not vid:
+            return
+        outdir = Path(self.job.folder) / self.job.subdir
+        for f in glob.glob(str(outdir / f"*[[]{glob.escape(vid)}[]].*.vtt")) + \
+                glob.glob(str(outdir / f"*[[]{glob.escape(vid)}[]].*.srt")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+    def run(self) -> None:
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(self.job.url, download=True)
-                info = ydl.sanitize_info(info)
+            try:
+                info = self._download(self.job.subtitles)
+            except DownloadError as e:
+                # A subtitle failure (often YouTube rate-limiting) shouldn't cost the video
+                if not (self.job.subtitles and "subtitles" in str(e) and not self.stop_reason):
+                    raise
+                info = self._download(False)
+                self._remove_subtitle_files(info)
             path = ""
             for rd in info.get("requested_downloads") or []:
                 path = rd.get("filepath") or path
@@ -667,13 +713,36 @@ class MainWindow(QMainWindow):
         top.addWidget(about_btn, 0, 9)
 
         mode_row = QHBoxLayout()
-        self.video_radio = QRadioButton("Video")
-        self.audio_radio = QRadioButton("Audio only")
+        self.video_btn = QPushButton(QIcon.fromTheme("video-x-generic"), "Video")
+        self.audio_btn = QPushButton(QIcon.fromTheme("audio-x-generic"), "Audio")
         self.mode_group = QButtonGroup(self)
-        self.mode_group.addButton(self.video_radio)
-        self.mode_group.addButton(self.audio_radio)
-        mode_row.addWidget(self.video_radio)
-        mode_row.addWidget(self.audio_radio)
+        switch = QHBoxLayout()
+        switch.setSpacing(0)
+        for b in (self.video_btn, self.audio_btn):
+            b.setCheckable(True)
+            self.mode_group.addButton(b)
+            switch.addWidget(b)
+        self.mode_group.setExclusive(True)
+        # Same style in both states so the two halves stay the same size
+        base = ("QPushButton { padding: 0 12px; font-weight: bold; color: palette(button-text); "
+                "background: palette(button); border: 1px solid palette(mid); }"
+                "QPushButton:hover:!checked { background: palette(midlight); }"
+                "QPushButton:checked { background: palette(highlight); "
+                "color: palette(highlighted-text); border-color: palette(highlight); }")
+        self.video_btn.setStyleSheet(base.replace("border: 1px solid palette(mid); }",
+            "border: 1px solid palette(mid); border-top-left-radius: 4px; "
+            "border-bottom-left-radius: 4px; border-right: none; }"))
+        self.audio_btn.setStyleSheet(base.replace("border: 1px solid palette(mid); }",
+            "border: 1px solid palette(mid); border-top-right-radius: 4px; "
+            "border-bottom-right-radius: 4px; border-left: none; }"))
+        height = self.paste_btn.sizeHint().height()
+        width = max(110, *(b.sizeHint().width() for b in (self.video_btn, self.audio_btn)))
+        for b in (self.video_btn, self.audio_btn):
+            b.setFixedSize(width, height)
+        self.video_btn.setToolTip("Download video (saved to the Video folder)")
+        self.audio_btn.setToolTip("Download audio only, as Artist - Song "
+                                    "(saved to the Audio folder)")
+        mode_row.addLayout(switch)
         mode_row.addSpacing(16)
 
         self.quality_label = QLabel("Quality:")
@@ -685,8 +754,11 @@ class MainWindow(QMainWindow):
         self.bitrate_label = QLabel("Bitrate:")
         self.bitrate_combo = QComboBox()
         self.bitrate_combo.addItems(AUDIO_BITRATES)
-        for w in (self.quality_label, self.quality_combo, self.format_label, self.format_combo,
-                  self.bitrate_label, self.bitrate_combo):
+        self.subs_check = QCheckBox("Subtitles")
+        self.subs_check.setToolTip("Download subtitles in your language (or English) and add\n"
+                                   "them to the video. Uses auto-generated ones if needed.")
+        for w in (self.quality_label, self.quality_combo, self.subs_check, self.format_label,
+                  self.format_combo, self.bitrate_label, self.bitrate_combo):
             mode_row.addWidget(w)
         mode_row.addSpacing(16)
         self.playlist_check = QCheckBox("Whole playlist")
@@ -701,7 +773,8 @@ class MainWindow(QMainWindow):
         mode_row.addWidget(self.parallel_spin)
         top.addLayout(mode_row, 1, 0, 1, 9)
 
-        top.addWidget(QLabel("Save to:"), 2, 0)
+        self.folder_label = QLabel()
+        top.addWidget(self.folder_label, 2, 0)
         self.folder_edit = QLineEdit(readOnly=True)
         top.addWidget(self.folder_edit, 2, 1, 1, 6)
         change = QPushButton("Change…")
@@ -773,14 +846,21 @@ class MainWindow(QMainWindow):
         self.table.addAction(delete_act)
 
         # restore settings
-        default_folder = str(Path.home() / "Downloads")
-        self.folder_edit.setText(self.settings.value("folder", default_folder))
-        (self.audio_radio if self.settings.value("mode", "video") == "audio"
-         else self.video_radio).setChecked(True)
+        def default(sub):
+            p = Path.home() / sub
+            return str(p if p.is_dir() else Path.home() / "Downloads")
+        old = self.settings.value("folder")   # v0.1 had one folder; it becomes the audio one
+        self.folders = {
+            "video": self.settings.value("folder_video", default("Videos")),
+            "audio": self.settings.value("folder_audio", old or default("Music")),
+        }
+        (self.audio_btn if self.settings.value("mode", "video") == "audio"
+         else self.video_btn).setChecked(True)
         self.quality_combo.setCurrentText(self.settings.value("quality", "1080p"))
         self.format_combo.setCurrentText(self.settings.value("audio_format", "mp3"))
         self.bitrate_combo.setCurrentText(self.settings.value("audio_bitrate", "Best"))
         self.playlist_check.setChecked(self.settings.value("playlist", False, type=bool))
+        self.subs_check.setChecked(self.settings.value("subtitles", False, type=bool))
         self.parallel_spin.setValue(self.settings.value("parallel", 2, type=int))
         geo = self.settings.value("geometry")
         if geo is not None:
@@ -870,9 +950,11 @@ class MainWindow(QMainWindow):
         return b
 
     def update_mode_widgets(self):
-        audio = self.audio_radio.isChecked()
-        for w in (self.quality_label, self.quality_combo):
+        audio = self.audio_btn.isChecked()
+        for w in (self.quality_label, self.quality_combo, self.subs_check):
             w.setVisible(not audio)
+        self.folder_label.setText("Save audio to:" if audio else "Save video to:")
+        self.folder_edit.setText(self.folders["audio" if audio else "video"])
         for w in (self.format_label, self.format_combo, self.bitrate_label, self.bitrate_combo):
             w.setVisible(audio)
         self.format_combo.setEnabled(bool(self.ffmpeg))
@@ -935,11 +1017,12 @@ class MainWindow(QMainWindow):
 
     def _current_choice(self) -> dict:
         return dict(
-            mode="audio" if self.audio_radio.isChecked() else "video",
+            mode="audio" if self.audio_btn.isChecked() else "video",
             quality=self.quality_combo.currentText(),
             audio_format=self.format_combo.currentText() if self.ffmpeg else "original",
             audio_bitrate=self.bitrate_combo.currentText(),
             folder=self.folder_edit.text(),
+            subtitles=self.video_btn.isChecked() and self.subs_check.isChecked(),
         )
 
     def on_resolved(self, entries: list, subdir: str, choice: dict):
@@ -1180,8 +1263,11 @@ class MainWindow(QMainWindow):
         m.exec(self.table.viewport().mapToGlobal(pos))
 
     def choose_folder(self):
-        d = QFileDialog.getExistingDirectory(self, "Download folder", self.folder_edit.text())
+        audio = self.audio_btn.isChecked()
+        d = QFileDialog.getExistingDirectory(
+            self, "Audio folder" if audio else "Video folder", self.folder_edit.text())
         if d:
+            self.folders["audio" if audio else "video"] = d
             self.folder_edit.setText(d)
 
     # ---- persistence
@@ -1220,7 +1306,10 @@ class MainWindow(QMainWindow):
                 w.join(timeout=3)
         s = self.settings
         c = self._current_choice()
-        s.setValue("folder", c["folder"])
+        s.setValue("folder_video", self.folders["video"])
+        s.setValue("folder_audio", self.folders["audio"])
+        s.remove("folder")
+        s.setValue("subtitles", self.subs_check.isChecked())
         s.setValue("mode", c["mode"])
         s.setValue("quality", c["quality"])
         s.setValue("audio_format", self.format_combo.currentText())

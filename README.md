@@ -10,6 +10,8 @@ Built with [yt-dlp](https://github.com/yt-dlp/yt-dlp) and Qt (PySide6).
 
 - Download queue with pause, resume, cancel and retry
 - Video up to 4K, or audio only as MP3, M4A or Opus
+- Separate save folders for video and audio
+- Optional subtitles, embedded in the video
 - Audio files named `Artist - Song`
 - Playlist support: preview a playlist and choose which items to download
 - Several downloads at once
@@ -48,8 +50,8 @@ Then open **Wavefall Media Downloader** from your applications menu, or run `./r
 
 ## Usage
 
-1. Paste a link and choose **Video** or **Audio only**.
-2. Pick the quality or audio format.
+1. Paste a link and choose **Video** or **Audio**.
+2. Pick the quality or audio format. For video, tick **Subtitles** to include them.
 3. Click **Add**. The download starts straight away.
 
 Tick **Whole playlist** to download every item in a playlist. Double-click a finished
